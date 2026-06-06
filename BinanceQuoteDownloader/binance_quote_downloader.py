@@ -167,8 +167,18 @@ def load_and_merge(extract_dir):
                 fpath,
                 header=None,
                 names=BINANCE_COLS,
-                usecols=["open_time", "open", "high", "low", "close", "volume"],
+                usecols=[
+                    "open_time",
+                    "open",
+                    "high",
+                    "low",
+                    "close",
+                    "volume",
+                    "trades",
+                    "taker_buy_base",
+                ],
             )
+
             chunks.append(df)
             loaded_files += 1
 
@@ -196,16 +206,21 @@ def normalize_timestamps(df):
 
     return df
 
-
 def convert_and_save(df, output_file):
+
     print("Converting timestamps and sorting...")
 
     rows_before_cleanup = len(df)
-    df["open_time"] = pd.to_numeric(df["open_time"], errors="coerce")
+
+    df["open_time"] = pd.to_numeric(
+        df["open_time"],
+        errors="coerce"
+    )
 
     nan_count = int(df["open_time"].isna().sum())
 
     df.dropna(subset=["open_time"], inplace=True)
+
     df["open_time"] = df["open_time"].astype("int64")
 
     if nan_count:
@@ -216,48 +231,218 @@ def convert_and_save(df, output_file):
     ts_min = 1_262_304_000_000
     ts_max = 1_924_992_000_000
 
-    bad = ((df["open_time"] < ts_min) | (df["open_time"] > ts_max)).sum()
+    bad = (
+        (df["open_time"] < ts_min)
+        | (df["open_time"] > ts_max)
+    ).sum()
 
     if bad:
         print(f"Out-of-range rows removed: {bad:,}")
 
-    df = df[(df["open_time"] >= ts_min) & (df["open_time"] <= ts_max)].copy()
+    df = df[
+        (df["open_time"] >= ts_min)
+        & (df["open_time"] <= ts_max)
+    ].copy()
 
-    df["dt"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
+    print(f"Rows after cleanup: {len(df):,}")
+
+    df.sort_values(
+        "open_time",
+        ascending=True,
+        inplace=True
+    )
+
+    df["dt"] = pd.to_datetime(
+        df["open_time"],
+        unit="ms",
+        utc=True
+    )
 
     dt = df["dt"]
 
     df["Date"] = (
-        dt.dt.month.astype(str).str.zfill(2) + "/" +
-        dt.dt.day.astype(str).str.zfill(2) + "/" +
-        dt.dt.year.astype(str)
+        dt.dt.month.astype(str).str.zfill(2)
+        + "/"
+        + dt.dt.day.astype(str).str.zfill(2)
+        + "/"
+        + dt.dt.year.astype(str)
     )
 
     df["Time"] = (
-        dt.dt.hour.astype(str).str.zfill(2) + ":" +
-        dt.dt.minute.astype(str).str.zfill(2)
+        dt.dt.hour.astype(str).str.zfill(2)
+        + ":"
+        + dt.dt.minute.astype(str).str.zfill(2)
     )
 
-    df.sort_values("open_time", ascending=True, inplace=True)
-    before_dedup = len(df)
-    df.drop_duplicates(subset="open_time", inplace=True)
-    duplicates_removed = before_dedup - len(df)
-    print(f"Duplicate rows removed: {duplicates_removed:,}")
+    print("\nChecking duplicate minute bars...")
 
-    out = df[["Date", "Time", "open", "high", "low", "close", "volume"]].copy()
+    df["volume"] = pd.to_numeric(
+        df["volume"],
+        errors="coerce"
+    ).fillna(0)
+
+    dup_count_before = len(df)
+
+    df.sort_values(
+        ["Date", "Time", "volume"],
+        ascending=[True, True, False],
+        inplace=True
+    )
+
+    df = df.drop_duplicates(
+        subset=["Date", "Time"],
+        keep="first"
+    )
+
+    removed = dup_count_before - len(df)
+
+    if removed:
+        print(f"Duplicate minute bars removed: {removed:,}")
+
+    # --------------------------------------------------
+    # Numeric conversion
+    # --------------------------------------------------
+
+    for col in [
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "taker_buy_base",
+        "trades",
+    ]:
+        df[col] = pd.to_numeric(
+            df[col],
+            errors="coerce"
+        )
+
+    df.dropna(
+        subset=[
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+            "taker_buy_base",
+            "trades",
+        ],
+        inplace=True
+    )
+
+    # --------------------------------------------------
+    # MultiCharts fields
+    # --------------------------------------------------
+
+    df["Volume"] = (
+        df["volume"] * 100_000_000
+    ).round().astype("int64")
+
+    df["Up Volume"] = (
+        df["taker_buy_base"] * 100_000_000
+    ).round().astype("int64")
+
+    df["Down Volume"] = (
+        df["Volume"] - df["Up Volume"]
+    ).astype("int64")
+
+
+    df["Total Ticks"] = (
+        df["trades"]
+    ).round().astype("int64")
+
+    # --------------------------------------------------
+    # Remove empty candles
+    # --------------------------------------------------
+
+    empty_bar_mask = (
+        (df["open"] == df["high"])
+        & (df["high"] == df["low"])
+        & (df["low"] == df["close"])
+        & (df["Volume"] == 0)
+        & (df["Up Volume"] == 0)
+        & (df["Down Volume"] == 0)
+        & (df["Total Ticks"] == 0)
+    )
+
+    removed_empty_bars = int(empty_bar_mask.sum())
+
+    print(
+        f"Empty candles removed: "
+        f"{removed_empty_bars:,}"
+    )
+
+    df = df.loc[~empty_bar_mask].copy()
+
+    # --------------------------------------------------
+    # Integer validation
+    # --------------------------------------------------
+
+    for col in [
+        "Volume",
+        "Up Volume",
+        "Down Volume",
+        "Total Ticks",
+    ]:
+        if not pd.api.types.is_integer_dtype(df[col]):
+            raise ValueError(
+                f"Column {col} contains non-integer values"
+            )
+
+    df.sort_values(
+        "open_time",
+        ascending=True,
+        inplace=True
+    )
+
+    out = df[
+        [
+            "Date",
+            "Time",
+            "open",
+            "high",
+            "low",
+            "close",
+            "Volume",
+            "Up Volume",
+            "Down Volume",
+            "Total Ticks",
+        ]
+    ].copy()
 
     out.columns = [
-        "Date", "Time", "Open", "High", "Low", "Close", "Volume"
+        "Date",
+        "Time",
+        "Open",
+        "High",
+        "Low",
+        "Close",
+        "Volume",
+        "Up Volume",
+        "Down Volume",
+        "Total Ticks",
     ]
 
-    out.to_csv(output_file, index=False)
-
-    print(f"Rows before cleanup: {rows_before_cleanup:,}")
-    print(f"Rows saved: {len(out):,}")
-    print(
-        f"Range: {out['Date'].iloc[0]} {out['Time'].iloc[0]}"
-        f" -> {out['Date'].iloc[-1]} {out['Time'].iloc[-1]}"
+    out.to_csv(
+        output_file,
+        index=False,
+        sep=",",
+        encoding="utf-8",
+        lineterminator="\n"
     )
+
+    print(f"\nRows before cleanup: {rows_before_cleanup:,}")
+    print(f"Rows saved: {len(out):,}")
+
+    print(
+        f"Range: "
+        f"{out['Date'].iloc[0]} "
+        f"{out['Time'].iloc[0]}"
+        f" -> "
+        f"{out['Date'].iloc[-1]} "
+        f"{out['Time'].iloc[-1]}"
+    )
+
     print(f"Output file: {output_file}")
 
 
